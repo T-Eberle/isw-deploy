@@ -1,0 +1,36 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: isw-deployment
+  namespace: default
+spec:
+  params:
+    - name: archiveUrl
+      value: "enter-your-archive"
+    - name: operatorCatalogImage
+      value: "enter-the-catalog-image"
+  timeouts:
+    pipeline: 8h0m0s
+  pipelineRef:
+    name: isw-deployment
+  taskRunTemplate:
+    serviceAccountName: pipeline
+    podTemplate:
+      securityContext:
+        fsGroup: 65532
+  workspaces:
+    - name: output
+      volumeClaimTemplate:
+        metadata:
+          creationTimestamp: null
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+          storageClassName: ocs-storagecluster-cephfs
+          volumeMode: Filesystem
+    - name: ssh-directory
+      secret:
+        secretName: ssh-ghe-private-key
