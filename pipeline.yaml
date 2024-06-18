@@ -1,0 +1,395 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: isw-deployment
+  namespace: default
+spec:
+  params:
+    - name: imageRegistry
+      type: string
+      default: "image-registry.openshift-image-registry.svc.cluster.local:5000"
+    - name: openshiftVersion
+      type: string
+      default: "4.12"
+    - name: archiveUrl
+      type: string
+    - name: operatorCatalogImage
+      type: string
+  workspaces:
+    - name: output
+      optional: false
+    - name: ssh-directory
+      optional: false
+  tasks:
+    - name: git-clone
+      taskRef:
+        name: git-clone-1-13-0
+        kind: ClusterTask
+      params:
+        - name: url
+          value: git@github.ibm.com:Thomas-Eberle2/tz-isw-deployment.git
+      workspaces:
+        - name: output
+          workspace: output
+        - name: ssh-directory
+          workspace: ssh-directory
+    - name: pre-install
+      runAfter:
+        - git-clone
+      taskRef:
+        name: openshift-client
+      params:
+        - name: VERSION
+          value: $(params.openshiftVersion)
+        - name: SCRIPT
+          value: |
+            echo "Adding required tasks."
+            oc apply -f helm-client.yaml
+            
+            echo "Creating project 'isw-images'"
+            oc new-project isw-images || oc project isw-images
+            
+            
+            echo "Adding image roles to pipeline service account"
+            oc policy add-role-to-user \
+            system:image-builder system:serviceaccount:default:pipeline \
+            --namespace=isw-images
+            
+            echo "Create Service Account in Openshift Marketplace"
+            oc create sa isw-image -n openshift-marketplace
+
+            echo "Add Image Puller role to service account"
+
+            oc policy add-role-to-user \
+            system:image-puller system:serviceaccount:openshift-marketplace:isw-image \
+            --namespace=isw-images
+
+            PULL_SECRET_NAME=$(oc get sa isw-image -n openshift-marketplace -o="jsonpath={ .imagePullSecrets[0].name }")
+
+            oc get secret -n openshift-marketplace $PULL_SECRET_NAME --template='{{index .data ".dockercfg" | base64decode}}' > isw_pull_secret.json
+
+            oc get ingresses.config/cluster -o jsonpath={.spec.domain} > cluster_host.txt
+            
+            oc apply -k ./foundation
+            oc new-project chartmuseum || oc project chartmuseum
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: prepare-images
+      runAfter:
+        - pre-install
+      taskRef:
+        name: openshift-client
+      params:
+        - name: VERSION
+          value: $(params.openshiftVersion)
+        - name: SCRIPT
+          value: |                       
+            cd /tmp
+            wget --progress=bar:force:noscroll $(params.archiveUrl) -O isw.tgz
+            tar xvf isw.tgz
+            
+            cd installation
+            
+            echo "Add Images"
+            oc adm catalog mirror file://local/index/isw_release/isw-operator-catalog@sha256:c60f65b03a30e6847836da96bf480d1fcf7771d9304dba00b89a9125b8eaeb1f image-registry.openshift-image-registry.svc.cluster.local:5000/isw-images
+            
+            echo "Add Manifests"
+            cd $(workspaces.manifest-dir.path)
+            oc adm catalog mirror $(params.operatorCatalogImage) image-registry.openshift-image-registry.svc.cluster.local:5000/isw-images --manifests-only
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: chartmuseum
+      taskSpec:
+        steps:
+        - image: alpine/helm:$(params.VERSION)
+          script: |
+            cd $(workspaces.manifest-dir.path)
+            set -x
+            helm upgrade --wait --install chartmuseum  https://github.com/chartmuseum/charts/releases/download/chartmuseum-3.10.2/chartmuseum-3.10.2.tgz --namespace chartmuseum --debug -f chartmuseum/values.yaml
+        params:
+          - default: "3.14.4"
+            description: The Helm Client Version to use
+            name: VERSION
+            type: string
+        workspaces:
+          - description: The workspace which contains helm manifests (e.g. values.yaml) which we want to
+              apply on the cluster.
+            name: manifest-dir
+      runAfter:
+        - prepare-images
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: mongodb
+      runAfter:
+        - chartmuseum
+      taskSpec:
+        params:
+          - default: "3.14.4"
+            description: The Helm Client Version to use
+            name: VERSION
+            type: string
+        steps:
+        - image: alpine/helm:$(params.VERSION)
+          script: |
+            cd $(workspaces.manifest-dir.path)
+            set -x
+            helm uninstall mongodb --namespace foundation --ignore-not-found
+            helm upgrade --wait --install mongodb https://charts.bitnami.com/bitnami/mongodb-15.1.7.tgz --namespace foundation --debug -f mongodb/values.yaml
+        workspaces:
+          - description: The workspace which contains helm manifests (e.g. values.yaml) which we want to
+              apply on the cluster.
+            name: manifest-dir
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: fetch-pull-credentials
+      runAfter:
+        - mongodb
+      taskSpec:
+        steps:
+          - name: jq-stuff
+            image: stedolan/jq
+            script: |
+              cd $(workspaces.manifest-dir.path)
+              echo "Result: $(cat isw_pull_secret.json)"
+              jq '."image-registry.openshift-image-registry.svc.cluster.local:5000".username' -r isw_pull_secret.json > isw_pull_secret_username.txt
+              jq '."image-registry.openshift-image-registry.svc.cluster.local:5000".password' -r isw_pull_secret.json > isw_pull_secret_password.txt
+        workspaces:
+          - description: The workspace which contains helm manifests (e.g. values.yaml) which we want to
+              apply on the cluster.
+            name: manifest-dir
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: prepare-manifest
+      runAfter:
+        - fetch-pull-credentials
+      taskSpec:
+        steps:
+          - name: replace-stuff
+            image: busybox
+            script: |
+              cd $(workspaces.manifest-dir.path)
+              CLUSTER_HOST=$(cat cluster_host.txt)
+              echo "Current Cluster Host: $CLUSTER_HOST"
+      
+              sed -i "s/CLUSTER_CLOUD/$CLUSTER_HOST/g" thirdparty-post-install/foundation/apicurio.yaml
+              
+              MANIFEST_DIR=$(ls -d -- manifests-local-index-isw_release-isw-operator-catalog-*)
+              
+              sed -i "s/local-index-isw_release-isw-operator-catalog-0/isw-operator-catalog/g" $MANIFEST_DIR/imageContentSourcePolicy.yaml
+
+        workspaces:
+          - description: The workspace which contains helm manifests (e.g. values.yaml) which we want to
+              apply on the cluster.
+            name: manifest-dir
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+    - name: third-party-install
+      runAfter:
+        - prepare-manifest
+      taskRef:
+        name: openshift-client
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+      params:
+        - name: VERSION
+          value: $(params.openshiftVersion)
+        - name: SCRIPT
+          value: |
+            oc apply -k thirdparty-post-install/chartmuseum
+            oc apply -k thirdparty-post-install/foundation
+    - name: isw-install
+      runAfter:
+        - third-party-install
+      taskRef:
+        name: openshift-client
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+      params:
+        - name: VERSION
+          value: $(params.openshiftVersion)
+        - name: SCRIPT
+          value: |
+            echo "Create projects"
+            oc new-project k5-tools || oc project k5-tools
+            CLUSTER_HOST=$(cat cluster_host.txt)
+            
+            USERNAME=$(cat isw_pull_secret_username.txt)
+            PASSWORD=$(cat isw_pull_secret_password.txt)
+            
+            oc get secret/pull-secret -n openshift-config --template='{{index .data ".dockerconfigjson" | base64decode}}' > pull_secret.json
+            
+            oc registry login --registry=image-registry.openshift-image-registry.svc.cluster.local:5000/isw-images --auth-basic="${USERNAME}:${PASSWORD}" --to=pull_secret.json
+            
+            oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=pull_secret.json 
+            
+            
+            
+            PULL_SECRET_NAME=$(oc get sa isw-image -n openshift-marketplace -o="jsonpath={ .imagePullSecrets[0].name }")
+            MANIFEST_DIR=$(ls -d -- manifests-local-index-isw_release-isw-operator-catalog-*)
+            
+            oc apply -f $MANIFEST_DIR/imageContentSourcePolicy.yaml
+            
+            cat <<EOF | oc apply -f -
+              apiVersion: operators.coreos.com/v1alpha1
+              kind: CatalogSource
+              metadata:
+                name: isw-operator-catalog
+                namespace: openshift-marketplace
+              spec:
+                displayName: IBM Industry Solutions Workbench Catalog
+                image: $(params.operatorCatalogImage)
+                publisher: IBM
+                sourceType: grpc
+                updateStrategy:
+                  registryPoll:
+                    interval: 30m
+                secrets:
+                  - ${PULL_SECRET_NAME}
+            EOF
+            
+            oc apply -k k5-tools/
+            
+            echo "Waiting for one minute"
+            sleep 1m
+            
+            echo "Check if the subscription is in state 'AtLatestKnown'"
+            oc wait --for=jsonpath='{.status.state}'=AtLatestKnown -n k5-tools subscription/isw --timeout=20m
+            
+            i=0
+            result=0
+            while [[ $i -lt 60 ]]
+            do
+              echo "Try number $((i+1)): Updating env variable DISABLE_EGRESS..."
+              oc set env -n k5-tools deploy/isw-controller-manager -c manager DISABLE_EGRESS=true
+              result=$(oc get -n k5-tools deploy isw-controller-manager -o go-template-file=disable_egress.gotemplate)
+              if [[ "$result" = "1" ]];then
+                echo "Setting env variable DISABLE_EGRESS has been successful."
+                break
+              fi
+                echo "Condition not met, waiting another minute until retrying."
+                sleep 60
+              i=$((i+1))
+            done
+            if [[ "$result" != "1" ]];then
+              echo "Error: Unable to set env variable DISABLE_EGRESS."
+              exit 1
+            fi
+            
+            cat <<EOF | oc apply -f -
+              apiVersion: k5.ibm.com/v1beta1
+              kind: ISW
+              metadata:
+                name: k5-tools
+                namespace: k5-tools
+              spec:
+                designer:
+                  enabled: true
+                domain: ${CLUSTER_HOST}
+                license:
+                  accept: true
+                values:
+                  global:
+                    network:
+                      egressPolicy:
+                        enabled: false
+            EOF
+            oc adm policy add-scc-to-user -n k5-tools -z k5-pipeline-sa pipelines-scc
+    - name: isw-configure
+      runAfter:
+        - isw-install
+      taskRef:
+        name: openshift-client
+      workspaces:
+        - name: manifest-dir
+          workspace: output
+      params:
+        - name: VERSION
+          value: $(params.openshiftVersion)
+        - name: SCRIPT
+          value: |
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-argocd-binding
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                url: "https://$(oc get route -n openshift-gitops openshift-gitops-server --template='{{ index .spec "host" }}')"
+                username: "admin"
+                password: "$(oc get secret -n openshift-gitops openshift-gitops-cluster --template='{{ index .data "admin.password" | base64decode }}')"
+                namespace: "openshift-gitops"
+            EOF
+            
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-iam-settings
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                hostname: "https://$(oc get route -n foundation keycloak --template='{{ index .spec "host" }}')"
+                realm: "k5-tools"
+            EOF
+            
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-iam-secret
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                adminUsername: "$(oc -n foundation get secret credential-keycloak --template='{{ index .data "ADMIN_USERNAME" | base64decode }}')"
+                adminPassword: "$(oc -n foundation get secret credential-keycloak --template='{{ index .data "ADMIN_PASSWORD" | base64decode }}')"
+            EOF
+            
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-encryption-master-key
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                key: "yOuRkEy123!"
+            EOF
+            
+            
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-designer-mongodb
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                connectionString: "mongodb://root:password@mongodb.svc.cluster.local:27017/admin?ssl=true"
+            EOF
+            
+            cat <<EOF | oc apply -f -
+              kind: Secret
+              apiVersion: v1
+              metadata:
+                name: k5-schema-registry-binding
+                namespace: k5-tools
+                labels:
+                  k5-configuration: 'true'
+              stringData:
+                url: "https://$(oc get apicurioregistry -n foundation apicurio --template='{{.status.info.host}}')"
+            EOF
+            
